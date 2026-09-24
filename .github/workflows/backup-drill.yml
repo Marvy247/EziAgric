@@ -1,0 +1,145 @@
+name: Backup Freshness & Restore Drills
+
+# Issue #266 — backups are only real when they've been restored:
+#   * freshness: weekly check that a daily backup exists within the SLA;
+#     missing/stale → backup_stale page (docs/runbooks/backup-restore-drill.md)
+#   * drill: quarterly end-to-end restore into an isolated stack with
+#     integrity assertions, app smoke, and a published RTO timing report
+#     (backup-drills/, committed like slo-snapshots/)
+on:
+  schedule:
+    # Weekly freshness gate — Monday 04:00 UTC.
+    - cron: "0 4 * * 1"
+    # Quarterly restore drill — 05:00 UTC on the 1st of Jan/Apr/Jul/Oct.
+    - cron: "0 5 1 1,4,7,10 *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "freshness only, or the full restore drill"
+        type: choice
+        options: [freshness, drill, both]
+        default: both
+      simulate_gap:
+        description: "Validate the missing-backup alert with a simulated gap"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: backup-drills
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  freshness:
+    name: Backup Freshness Gate
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'schedule' && github.event.schedule == '0 4 * * 1' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'freshness' || github.event.inputs.mode == 'both')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install AWS CLI deps (jq)
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Configure AWS credentials
+        if: github.event.inputs.simulate_gap != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Run freshness check (or simulated gap)
+        env:
+          S3_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
+          S3_PREFIX: ${{ secrets.BACKUP_S3_PREFIX || 'backups' }}
+          S3_ENDPOINT: ${{ secrets.BACKUP_S3_ENDPOINT }}
+          BACKUP_SLA_HOURS: "26"
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          ALERT_WEBHOOK_SECRET: ${{ secrets.ALERT_WEBHOOK_SECRET }}
+          SIMULATE_GAP: ${{ github.event.inputs.simulate_gap }}
+        run: |
+          chmod +x scripts/check-backup-freshness.sh
+          if [ "$SIMULATE_GAP" = "true" ]; then
+            ./scripts/check-backup-freshness.sh --simulate-gap
+          else
+            ./scripts/check-backup-freshness.sh
+          fi
+
+      - name: Notify on freshness failure
+        if: failure()
+        run: |
+          echo "::error title=Backup Missing/Stale::No daily backup within the SLA (or the simulated-gap validation failed as designed). See docs/runbooks/backup-restore-drill.md."
+          echo "### 🚨 Backup Freshness Alert" >> $GITHUB_STEP_SUMMARY
+          echo "RPO claims are unfounded until a fresh backup exists. Follow docs/runbooks/backup-restore-drill.md." >> $GITHUB_STEP_SUMMARY
+
+  drill:
+    name: Quarterly Restore Drill
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: >
+      github.event_name == 'schedule' && github.event.schedule == '0 5 1 1,4,7,10 *' ||
+      github.event_name == 'workflow_dispatch' && (github.event.inputs.mode == 'drill' || github.event.inputs.mode == 'both')
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tooling (jq, postgresql-client, gpg)
+        run: sudo apt-get update && sudo apt-get install -y jq postgresql-client gnupg
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION || 'us-east-1' }}
+
+      - name: Import GPG decryption key
+        env:
+          BACKUP_GPG_PRIVATE_KEY: ${{ secrets.BACKUP_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -z "$BACKUP_GPG_PRIVATE_KEY" ]; then
+            echo "::error title=Missing GPG key::BACKUP_GPG_PRIVATE_KEY secret is required to decrypt backups."
+            exit 1
+          fi
+          echo "$BACKUP_GPG_PRIVATE_KEY" | gpg --batch --import
+
+      - name: Run restore drill
+        env:
+          S3_BUCKET: ${{ secrets.BACKUP_S3_BUCKET }}
+          S3_PREFIX: ${{ secrets.BACKUP_S3_PREFIX || 'backups' }}
+          S3_ENDPOINT: ${{ secrets.BACKUP_S3_ENDPOINT }}
+          GPG_RECIPIENT: ${{ secrets.BACKUP_GPG_RECIPIENT }}
+          RTO_TARGET_MINUTES: "30"
+        run: |
+          chmod +x scripts/backup-restore-drill.sh scripts/db-restore.sh scripts/staging-admin-smoke-test.sh
+          ./scripts/backup-restore-drill.sh --exercise-restore-script
+
+      - name: Upload drill report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-drill-report-${{ github.run_id }}
+          path: |
+            backup-drills/*.json
+            backup-drills/*.jsonl
+          retention-days: 400
+
+      - name: Commit RTO history
+        if: success()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          file_pattern: backup-drills/rto-history.jsonl backup-drills/drill-report-*.json
+          commit_message: "chore(backup): record quarterly restore drill RTO (#266)"
+
+      - name: Notify on drill failure
+        if: failure()
+        run: |
+          echo "::error title=Backup Restore Drill Failed::The quarterly restore drill failed — file findings per docs/runbooks/backup-restore-drill.md."
+          echo "### 🚨 Backup Restore Drill Failed" >> $GITHUB_STEP_SUMMARY
+          echo "Critical findings must be fixed before sign-off (runbook Sign-off checklist)." >> $GITHUB_STEP_SUMMARY

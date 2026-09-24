@@ -1,0 +1,108 @@
+name: Migration Check
+
+# CI migration gate specified by docs/migration-rollback-playbook.md §7
+# (issue #265): scans PR migration diffs for backward-incompatible DDL,
+# verifies migration_lock.toml, annotates the PR, and blocks merges to main
+# unless the PR carries the `migration:destructive-approved` label.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "backend/prisma/migrations/**"
+      - "backend/prisma/migration_lock.toml"
+      - ".github/workflows/migration-check.yml"
+      - "scripts/check-migration-compat.sh"
+
+concurrency:
+  group: migration-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  migration-compat:
+    name: Migration Backward-Compatibility Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: List changed migration files
+        id: diff
+        run: |
+          git fetch origin "${{ github.base_ref }}" --depth=100 || true
+          BASE="origin/${{ github.base_ref }}"
+          CHANGED=$(git diff --name-only "${BASE}...HEAD" -- 'backend/prisma/migrations' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No migration files changed — gate passes."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Changed migration files:"
+            echo "$CHANGED"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "$CHANGED" > /tmp/changed-migrations.txt
+          fi
+          LOCK_CHANGED=$(git diff --name-only "${BASE}...HEAD" -- 'backend/prisma/migration_lock.toml' || true)
+          echo "lock_changed=$([ -n "$LOCK_CHANGED" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Scan for backward-incompatible DDL
+        id: scan
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          chmod +x scripts/check-migration-compat.sh
+          SQL_FILES=$(grep '\.sql$' /tmp/changed-migrations.txt 2>/dev/null | while read -r f; do
+            [ -f "$f" ] && echo "$f"
+          done || true)
+          if [ -z "$SQL_FILES" ]; then
+            echo "No added/modified migration.sql files (deletions only) — nothing to scan."
+            echo "code=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          set +e
+          ./scripts/check-migration-compat.sh --github-annotations $SQL_FILES
+          CODE=$?
+          set -e
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          if [ "$CODE" -eq 2 ]; then
+            echo "::error title=Migration Check Usage Error::Scanner could not read the changed migration files."
+            exit 1
+          fi
+
+      - name: Verify migration_lock.toml is present and correct
+        run: |
+          if [ ! -f backend/prisma/migration_lock.toml ]; then
+            echo "::error title=migration_lock.toml missing::Every Prisma project must commit backend/prisma/migration_lock.toml."
+            exit 1
+          fi
+          grep -Eq 'provider\s*=\s*"postgresql"' backend/prisma/migration_lock.toml || {
+            echo "::error title=migration_lock.toml provider changed::provider must remain \"postgresql\"."
+            exit 1
+          }
+          echo "✓ migration_lock.toml ok"
+
+      - name: Enforce approval label for risky DDL on main
+        if: steps.scan.outputs.code == '1'
+        env:
+          HAS_APPROVAL: ${{ contains(github.event.pull_request.labels.*.name, 'migration:destructive-approved') }}
+        run: |
+          if [ "$HAS_APPROVAL" = "true" ]; then
+            echo "::warning title=Destructive migration approved::BLOCK-tier DDL present but the migration:destructive-approved label is set — merging under explicit review."
+            echo "### ⚠️ Destructive migration (approved)" >> $GITHUB_STEP_SUMMARY
+            echo "BLOCK-tier DDL found; \`migration:destructive-approved\` label present. See migration-rollback-playbook.md §8." >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+          if [ "${{ github.base_ref }}" = "main" ]; then
+            echo "::error title=Backward-incompatible migration::BLOCK-tier DDL detected on a PR targeting main. Refactor to expand → migrate → contract, or add the migration:destructive-approved label after DBA/on-call review (migration-rollback-playbook.md §2/§8)."
+            echo "### 🚨 Migration Check Failed" >> $GITHUB_STEP_SUMMARY
+            echo "Backward-incompatible DDL blocks merge to \`main\`." >> $GITHUB_STEP_SUMMARY
+            echo "Either refactor per **expand → migrate → contract**, or obtain the \`migration:destructive-approved\` label (reviewed rollback.sql + maintenance window required)." >> $GITHUB_STEP_SUMMARY
+            echo "Runbook: docs/runbooks/database-migration.md" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "::warning title=Backward-incompatible migration::BLOCK-tier DDL detected (PR targets ${{ github.base_ref }}; hard block applies once this reaches main)."
+          echo "### ⚠️ Migration Check Warning" >> $GITHUB_STEP_SUMMARY
+          echo "BLOCK-tier DDL present — this will **fail** when the PR targets \`main\` without the \`migration:destructive-approved\` label." >> $GITHUB_STEP_SUMMARY
+
+      - name: Summary when no migration changed
+        if: steps.diff.outputs.changed != 'true'
+        run: echo "No migration SQL changes in this PR — nothing to scan." >> $GITHUB_STEP_SUMMARY

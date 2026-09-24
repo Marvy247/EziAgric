@@ -7,16 +7,19 @@ version: '3.8'
 #   dev      – local development (postgres + redis, persistent volume)
 #   staging  – staging parity (postgres + redis, seeded synthetic data)
 #   test     – CI / unit-test isolation (ephemeral in-memory postgres)
+#   preview  – per-PR ephemeral stack (backend + postgres + redis)
 #
 # Usage:
 #   docker compose --profile dev     up -d
 #   docker compose --profile staging up -d
 #   docker compose --profile test    up -d
+#   docker compose --profile preview up -d
 #
 # Or use the helper scripts in scripts/:
 #   ./scripts/dev-up.sh
 #   ./scripts/staging-up.sh
 #   ./scripts/test-up.sh
+#   ./scripts/preview-up.sh      (see docs/preview-environments.md)
 # ─────────────────────────────────────────────────────────────────────────────
 
 x-postgres-healthcheck: &postgres-healthcheck
@@ -121,6 +124,74 @@ services:
       retries: 10
       start_period: 3s
     profiles: [test]
+
+  # ── Preview (per-PR ephemeral, issue #264) ──────────────────────────────────
+  # Full backend + DB + redis stack for one PR. Isolated by
+  # COMPOSE_PROJECT_NAME=eziagric-pr-<n> (set by scripts/preview-up.sh), so
+  # concurrent previews never share volumes, networks, or ports.
+  # Host ports are offset (5435 / 6382 / 4001) to avoid colliding with
+  # dev (5432/6379), test (5433/6381) and staging (5434/6380).
+  postgres-preview:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${PREVIEW_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${PREVIEW_POSTGRES_PASSWORD:-preview-password}
+      POSTGRES_DB: ${PREVIEW_POSTGRES_DB:-amana_preview}
+    ports:
+      - "${PREVIEW_POSTGRES_PORT:-5435}:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PREVIEW_POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    profiles: [preview]
+
+  redis-preview:
+    image: redis:7-alpine
+    ports:
+      - "${PREVIEW_REDIS_PORT:-6382}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+    profiles: [preview]
+
+  backend-preview:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: ${PREVIEW_NODE_ENV:-staging}
+      PORT: 4000
+      DATABASE_URL: postgresql://${PREVIEW_POSTGRES_USER:-postgres}:${PREVIEW_POSTGRES_PASSWORD:-preview-password}@postgres-preview:5432/${PREVIEW_POSTGRES_DB:-amana_preview}
+      REDIS_URL: redis://redis-preview:6379
+      JWT_SECRET: ${PREVIEW_JWT_SECRET:-preview-jwt-secret-minimum-32-characters-xx}
+      AMANA_ESCROW_CONTRACT_ID: ${PREVIEW_CONTRACT_ID:-CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC}
+      USDC_CONTRACT_ID: ${PREVIEW_USDC_CONTRACT_ID:-CBIELTK6YBZJU5UP2WWQEUCY7PUJE7R6OB3NIUJKL5UH4WJQJ6HVHKX}
+      ADMIN_ROUTES_ENABLED: ${PREVIEW_ADMIN_ROUTES_ENABLED:-true}
+      CORS_ORIGINS: ${PREVIEW_CORS_ORIGINS:-}
+      ALERT_WEBHOOK_URL: ${PREVIEW_ALERT_WEBHOOK_URL:-}
+      STELLAR_NETWORK: ${PREVIEW_STELLAR_NETWORK:-testnet}
+      STELLAR_RPC_URL: ${PREVIEW_STELLAR_RPC_URL:-https://soroban-testnet.stellar.org}
+    ports:
+      - "${PREVIEW_PORT:-4001}:4000"
+    depends_on:
+      postgres-preview:
+        condition: service_healthy
+      redis-preview:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:4000/health/ready > /dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    profiles: [preview]
 
 volumes:
   postgres_data:

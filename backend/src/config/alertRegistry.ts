@@ -114,6 +114,34 @@ export const ALERT_REGISTRY: Record<AlertType, AlertRegistryEntry> = {
     // underlying gap until someone's had a chance to patch the denylist.
     dedupeWindowMs: 24 * 60 * 60_000,
   },
+  mobile_crash_spike: {
+    routing: "page",
+    runbookUrl:
+      "https://github.com/Marvy247/EziAgric/blob/main/mobile/docs/crash-reporting.md#crash-spike-runbook",
+    description:
+      "A release crossed the crash/ANR spike threshold — blocks rollout promotion until triaged.",
+    // Spikes persist while the offending build is out; 15 minutes matches
+    // the intake's own alert cooldown so pages aren't repeated per report.
+    dedupeWindowMs: 15 * 60_000,
+  },
+  backup_stale: {
+    routing: "page",
+    runbookUrl: "docs/runbooks/backup-restore-drill.md",
+    description:
+      "No fresh database backup within the SLA — restores are unverifiable and RPO claims are unfounded.",
+    // Backup cadence is daily; a 6-hour window avoids re-paging every
+    // check while the backup job is being fixed.
+    dedupeWindowMs: 6 * 60 * 60_000,
+  },
+  deploy_rollback_triggered: {
+    routing: "page",
+    runbookUrl: "docs/runbooks/rollback.md",
+    description:
+      "Error-rate burn during a deploy automatically triggered a rollback — confirm recovery and open a postmortem.",
+    // One deploy episode = one page; repeats while the burn persists would
+    // drown the on-call during an already-active incident.
+    dedupeWindowMs: 30 * 60_000,
+  },
 };
 
 export function getAlertRegistryEntry(type: AlertType): AlertRegistryEntry {

@@ -49,6 +49,26 @@ ENCRYPTED_FILE="$TMPDIR/$FILENAME"
 echo "[backup] Running pg_dump → $BACKUP_TYPE/$FILENAME"
 pg_dump "$DATABASE_URL" | gzip -9 > "$DUMP_FILE"
 
+# --- Integrity manifest (issue #266) ---
+# sha256 of the gzip dump + per-table row counts, uploaded next to the backup
+# so restore drills can assert integrity without guessing.
+DUMP_SHA256=$(sha256sum "$DUMP_FILE" | awk '{print $1}')
+MANIFEST_FILE="$TMPDIR/$FILENAME.manifest.json"
+echo "[backup] Recording integrity manifest"
+{
+  printf '{"backup":"%s","type":"%s","createdAt":"%s","sha256":"%s","rowCounts":{' \
+    "$FILENAME" "$BACKUP_TYPE" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$DUMP_SHA256"
+  FIRST=true
+  while IFS= read -r TBL; do
+    [[ -z "$TBL" ]] && continue
+    COUNT=$(psql "$DATABASE_URL" -At -c "SELECT COUNT(*) FROM \"$TBL\"" 2>/dev/null || echo "-1")
+    [[ "$FIRST" == "true" ]] || printf ','
+    FIRST=false
+    printf '"%s":%s' "$TBL" "$COUNT"
+  done < <(psql "$DATABASE_URL" -At -c "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename" 2>/dev/null || true)
+  printf '}}\n'
+} > "$MANIFEST_FILE"
+
 echo "[backup] Encrypting with GPG (recipient: $GPG_RECIPIENT)"
 gpg --batch --yes --trust-model always \
     --recipient "$GPG_RECIPIENT" \
@@ -67,6 +87,9 @@ if [[ "$DRY_RUN" == "true" ]]; then
 else
   echo "[backup] Uploading to s3://$S3_BUCKET/$S3_KEY"
   aws "${AWS_ARGS[@]}" s3 cp "$ENCRYPTED_FILE" "s3://$S3_BUCKET/$S3_KEY" \
+      --storage-class STANDARD_IA
+  echo "[backup] Uploading manifest to s3://$S3_BUCKET/$S3_KEY.manifest.json"
+  aws "${AWS_ARGS[@]}" s3 cp "$MANIFEST_FILE" "s3://$S3_BUCKET/$S3_KEY.manifest.json" \
       --storage-class STANDARD_IA
   echo "[backup] Upload complete."
 fi

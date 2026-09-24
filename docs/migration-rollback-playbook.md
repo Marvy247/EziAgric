@@ -55,6 +55,31 @@ Always use `scripts/migrate-safe.sh` instead of running `prisma migrate deploy` 
 | `DROP TABLE` | Ensure no foreign key references; archive data if needed |
 | `TRUNCATE` | Only in emergency data cleanup; always backup first |
 
+### Expand → Migrate → Contract discipline
+
+Every schema change ships in **three separately deployable phases** so that
+at every commit both the previous and the next release of the application
+run correctly against the same database — the property that makes rolling
+deploys ([deployment.md](runbooks/deployment.md#backend-zero-downtime-rolling-deploy))
+and instant rollback safe:
+
+| Phase | What ships | Rollback story |
+|---|---|---|
+| **1. Expand** | Additive DDL only: new table, new nullable column, new index (`CONCURRENTLY` in prod). No existing shape changes. Old code ignores the new objects. | Redeploy previous code; DDL can stay (harmless) or be dropped later in a contract phase. |
+| **2. Migrate** | Dual-write / backfill: application writes both old+new (feature-flagged), backfill historical rows, verify counts/checksums. Schema still readable by old code. | Turn the flag off; old path is intact. |
+| **3. Contract** | Remove the old column/table/unique constraint **only after** no release in the rollback window still references it. | Previous release is no longer supported — this is the point of no return; schedule it for the end of the rollout window, never bundled with phase 1. |
+
+Rules of thumb:
+
+- **One phase per PR.** `migration-check.yml` blocks phase-3 DDL
+  (`DROP`/`RENAME`/`SET NOT NULL`/type changes) on PRs to `main` unless the
+  PR carries `migration:destructive-approved` — so a rename smuggled into an
+  "add a column" PR fails CI, not staging.
+- Phase 3 PRs must state which releases still reference the old shape
+  (usually: "everything older than the previous production release").
+- Feature flags are the application half of expand/migrate: flip
+  `rolloutPercentage` only while both paths are still written.
+
 ---
 
 ## 3. Writing a Rollback SQL File
@@ -148,21 +173,46 @@ Before applying any migration to production:
 | Environment | When | Tool | Retention |
 |-------------|------|------|-----------|
 | Staging | Before every migration | `pg_dump` via `migrate-safe.sh` | 7 days |
-| Production | Before every migration + daily | Managed cloud backup + `pg_dump` | 30 days |
+| Production | Before every migration + daily | Managed cloud backup + `pg_dump` (`scripts/db-backup.sh`) | 30 days |
 
-Backups are stored in `backups/` locally (staging) and in encrypted cloud storage (production). The `backups/` directory is in `.gitignore`.
+Backups are stored in `backups/` locally (staging) and in encrypted cloud
+storage (production). The `backups/` directory is in `.gitignore`.
+
+Production backups uploaded by `scripts/db-backup.sh` carry an integrity
+manifest (`<backup-key>.manifest.json`: sha256 of the dump + per-table row
+counts) used by restore drills.
+
+**Backups are only trusted once restored.** Issue #266 automates both halves:
+
+- **Freshness gate** (weekly + pre-deploy): `scripts/check-backup-freshness.sh`
+  fails (and pages `backup_stale`) when the latest daily backup is missing or
+  older than `BACKUP_SLA_HOURS` (default 26h). `--simulate-gap` is the
+  controlled-gap validation of that alert.
+- **Restore drill** (quarterly): `scripts/backup-restore-drill.sh` restores the
+  latest backup into an isolated compose `test` stack, asserts manifest
+  integrity, boots the application against the restored copy, serves read
+  traffic, and records RTO vs `RTO_TARGET_MINUTES` under `backup-drills/`.
+
+Full procedure, failure modes, and the quarterly sign-off checklist:
+[runbooks/backup-restore-drill.md](runbooks/backup-restore-drill.md).
 
 ---
 
 ## 7. CI Migration Check
 
-The CI workflow `.github/workflows/migration-check.yml` runs on every PR that touches `backend/prisma/`:
+The CI workflow [`.github/workflows/migration-check.yml`](../.github/workflows/migration-check.yml)
+runs on every PR that touches `backend/prisma/`:
 
-- Lists the migration diff versus `main`
-- Scans new migration SQL for destructive DDL and emits warnings as PR annotations
-- Verifies `migration_lock.toml` is up to date
+- Lists the migration diff versus the PR base branch
+- Scans new migration SQL for backward-incompatible DDL via
+  [`scripts/check-migration-compat.sh`](../scripts/check-migration-compat.sh)
+  (BLOCK tier: `DROP`, `TRUNCATE`, renames, `SET NOT NULL`, column type
+  changes; WARN tier: unique constraints/indexes) and emits PR annotations
+- Verifies `migration_lock.toml` is present and still declares the
+  `postgresql` provider
 
-Failures block merge for production branches (`main`).
+Failures block merge for production branches (`main`) unless the approval
+label applies (§8).
 
 ---
 

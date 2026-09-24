@@ -141,6 +141,10 @@ export const envSchema = z.object({
   ALERT_WEBHOOK_URL: z.string().url().optional(),
   ALERT_WEBHOOK_SECRET: z.string().optional(),
   ALERT_COOLDOWN_MS: z.coerce.number().default(300_000),
+  // Mobile crash intake spike detection (issue #263)
+  CRASH_SPIKE_THRESHOLD: z.coerce.number().int().positive().default(10),
+  CRASH_SPIKE_WINDOW_MS: z.coerce.number().int().positive().default(900_000),
+  CRASH_INTAKE_RATE_LIMIT_PER_MIN: z.coerce.number().int().positive().default(60),
   // Admin Soroban tx failure alert tuning
   ADMIN_TX_FAILURE_THRESHOLD: z.coerce.number().int().positive().default(5),
   ADMIN_TX_FAILURE_WINDOW_MS: z.coerce.number().int().positive().default(300_000),

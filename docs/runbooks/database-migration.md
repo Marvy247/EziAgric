@@ -88,13 +88,23 @@ production.
 See [migration-rollback-playbook.md §6 Backup Strategy](../migration-rollback-playbook.md#6-backup-strategy)
 for where backups are stored and how to restore one.
 
+Backups are proven restorable by the automated drills in
+[backup-restore-drill.md](./backup-restore-drill.md): a weekly freshness gate
+(pages `backup_stale` when the latest daily backup is missing/stale beyond the
+SLA) and a quarterly restore drill with integrity assertions and a published
+RTO report (`backup-drills/`).
+
 ## CI enforcement
 
 [migration-rollback-playbook.md §7 CI Migration Check](../migration-rollback-playbook.md#7-ci-migration-check)
-documents a dedicated `migration-check.yml` workflow that scans PR
-migration diffs for destructive DDL and gates merges to `main` behind a
-`migration:destructive-approved` label. As of this writing that workflow
-isn't present in `.github/workflows/` (only `ci.yml` and `staging.yml`
-exist) - treat the label/approval process as the manual policy until the
-automated gate is actually wired up, and don't assume CI will catch a
-destructive migration for you today.
+is implemented by [`.github/workflows/migration-check.yml`](../../.github/workflows/migration-check.yml):
+every PR touching `backend/prisma/` is scanned by
+`scripts/check-migration-compat.sh` for backward-incompatible DDL (BLOCK
+tier fails the check; WARN tier annotates), `migration_lock.toml` is
+verified, and merges to `main` are gated behind the
+`migration:destructive-approved` label (playbook §8). Run the scanner
+locally before pushing:
+
+```bash
+./scripts/check-migration-compat.sh --dir backend/prisma/migrations
+```

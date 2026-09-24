@@ -1,0 +1,80 @@
+name: Mobile Crash Symbols
+
+# Exports JS bundles + sourcemaps for iOS/Android and attaches them to the
+# GitHub Release so crash reports (mobile/docs/crash-reporting.md) can be
+# symbolicated. Mirrors sbom.yml: release/tag triggered, 400-day retention,
+# plus a weekly rebuild on main to catch drift early.
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*.*.*"
+  schedule:
+    # Weekly symbol refresh — Monday 07:00 UTC (sbom.yml owns 06:00).
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export-symbols:
+    name: Export Crash Symbols (${{ matrix.platform }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [ios, android]
+    defaults:
+      run:
+        working-directory: mobile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: mobile/pnpm-lock.yaml
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Export bundle with sourcemaps
+        env:
+          RELEASE: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          mkdir -p symbols
+          npx react-native bundle \
+            --platform "${{ matrix.platform }}" \
+            --dev false \
+            --entry-file src/index.tsx \
+            --bundle-output "symbols/main.${{ matrix.platform }}.jsbundle" \
+            --sourcemap-output "symbols/main.${{ matrix.platform }}.jsbundle.map"
+          # Release id stamped into reports must match the artifact name.
+          echo "$RELEASE" > "symbols/RELEASE.txt"
+
+      - name: Upload symbols as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mobile-symbols-${{ matrix.platform }}-${{ github.run_id }}
+          path: mobile/symbols/
+          retention-days: 400
+
+      - name: Attach symbols to GitHub Release
+        if: github.event_name == 'release' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.release.tag_name || github.ref_name }}"
+          cd symbols
+          gh release upload "$TAG" \
+            "main.${{ matrix.platform }}.jsbundle" \
+            "main.${{ matrix.platform }}.jsbundle.map" \
+            "RELEASE.txt" \
+            --clobber --repo "${{ github.repository }}" || true

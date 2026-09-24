@@ -1,0 +1,284 @@
+name: PR Preview Environments
+
+# Ephemeral per-PR preview stack: backend + postgres + redis via the
+# `preview` Docker Compose profile, spun up by the `preview` label
+# (docs/preview-environments.md), smoke-tested automatically, exposed through
+# a short-lived tunnel whose URL is posted on the PR, torn down on
+# merge/close or when the budget cap (job timeout) is reached.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, closed]
+
+concurrency:
+  group: preview-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+env:
+  # Budget caps — see docs/preview-environments.md § Budget & cost guardrails.
+  PREVIEW_MAX_LIFETIME_MINUTES: "40"   # hard job timeout (leaves time for teardown)
+  PREVIEW_TTL_SECONDS: "600"           # how long the URL stays reachable
+  MAX_CONCURRENT_PREVIEWS: "3"         # concurrency ceiling (graceful skip above it)
+
+jobs:
+  ceiling:
+    name: Concurrency Ceiling Check
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+      current: ${{ steps.check.outputs.current }}
+    steps:
+      - name: Count active preview PRs
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const max = parseInt(process.env.MAX_CONCURRENT_PREVIEWS || '3', 10);
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const active = pulls.filter((pr) =>
+              pr.labels.some((l) => l.name === 'preview')
+            );
+            const current = active.length;
+            // The PR that triggered this run counts itself if already labeled.
+            const allowed = current <= max;
+            core.setOutput('allowed', String(allowed));
+            core.setOutput('current', String(current));
+            core.info(`Active previews: ${current}/${max} — ${allowed ? 'allowed' : 'over ceiling'}`);
+
+  deploy:
+    name: Deploy Preview Stack
+    needs: [ceiling]
+    if: >
+      github.event.action != 'closed' &&
+      (
+        github.event.action == 'labeled' && github.event.label.name == 'preview' ||
+        github.event.action != 'labeled' &&
+        contains(github.event.pull_request.labels.*.name, 'preview')
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 40   # budget cap: max lifetime enforced even if the TTL step hangs
+    env:
+      PREVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
+      PREVIEW_PORT: "4001"
+      PREVIEW_POSTGRES_PORT: "5435"
+      PREVIEW_REDIS_PORT: "6382"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enforce concurrency ceiling (graceful skip)
+        id: ceiling
+        if: needs.ceiling.outputs.allowed != 'true'
+        run: |
+          echo "::notice title=Preview skipped::Concurrency ceiling reached (${{ needs.ceiling.outputs.current }}/${{ env.MAX_CONCURRENT_PREVIEWS }} active previews). Remove the preview label from another PR first."
+          echo "### ⏭️ Preview skipped — concurrency ceiling" >> $GITHUB_STEP_SUMMARY
+          echo "Active previews: **${{ needs.ceiling.outputs.current }}/${{ env.MAX_CONCURRENT_PREVIEWS }}**. Graceful skip (not a failure); re-run after another preview tears down." >> $GITHUB_STEP_SUMMARY
+          echo "skipped=true" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node
+        if: steps.ceiling.outputs.skipped != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install PostgreSQL client
+        if: steps.ceiling.outputs.skipped != 'true'
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      - name: Install backend dependencies (migrations + seed)
+        if: steps.ceiling.outputs.skipped != 'true'
+        run: npm ci
+        working-directory: backend
+
+      - name: Start preview stack
+        if: steps.ceiling.outputs.skipped != 'true'
+        run: |
+          chmod +x scripts/preview-up.sh scripts/preview-down.sh scripts/preview-smoke.sh
+          ./scripts/preview-up.sh
+        timeout-minutes: 15
+
+      - name: Start public tunnel
+        if: steps.ceiling.outputs.skipped != 'true'
+        id: tunnel
+        run: |
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          nohup /tmp/cloudflared tunnel --url "http://localhost:${PREVIEW_PORT}" > /tmp/cloudflared.log 2>&1 &
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)
+            if [ -n "$URL" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "$URL" ]; then
+            echo "::error title=Preview tunnel failed::Could not establish a public tunnel URL."
+            cat /tmp/cloudflared.log || true
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Preview tunnel: $URL"
+
+      - name: E2E smoke against preview
+        if: steps.ceiling.outputs.skipped != 'true'
+        run: |
+          PREVIEW_URL="http://localhost:${PREVIEW_PORT}" \
+          PREVIEW_DB_URL="postgresql://postgres:preview-password@localhost:${PREVIEW_POSTGRES_PORT}/amana_preview" \
+          ./scripts/preview-smoke.sh
+        timeout-minutes: 5
+
+      - name: Verify public exposure
+        if: steps.ceiling.outputs.skipped != 'true'
+        run: |
+          for i in $(seq 1 15); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "${{ steps.tunnel.outputs.url }}/health/ready" || echo 000)
+            if [ "$CODE" = "200" ]; then echo "✓ Tunnel exposes /health/ready (200)"; exit 0; fi
+            sleep 2
+          done
+          echo "::error title=Preview exposure failed::Tunnel URL did not serve /health/ready."
+          exit 1
+
+      - name: Deploy contract against isolated testnet account
+        if: steps.ceiling.outputs.skipped != 'true' && env.TESTNET_ADMIN_SECRET != ''
+        env:
+          TESTNET_ADMIN_SECRET: ${{ secrets.PREVIEW_TESTNET_ADMIN_SECRET }}
+          TESTNET_TOKEN_CONTRACT: ${{ secrets.PREVIEW_TESTNET_TOKEN_CONTRACT }}
+        run: |
+          chmod +x scripts/deploy-contract-testnet.sh
+          ./scripts/deploy-contract-testnet.sh --token-contract="$TESTNET_TOKEN_CONTRACT" \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Post preview URL on the PR
+        if: steps.ceiling.outputs.skipped != 'true'
+        uses: actions/github-script@v7
+        env:
+          PREVIEW_URL: ${{ steps.tunnel.outputs.url }}
+          SMOKE: passed
+          TTL: ${{ env.PREVIEW_TTL_SECONDS }}
+        with:
+          script: |
+            const marker = '<!-- eziagric-preview-bot -->';
+            const url = process.env.PREVIEW_URL;
+            const ttlMin = Math.floor(parseInt(process.env.TTL || '600', 10) / 60);
+            const body = [
+              marker,
+              '## 🌿 Preview environment',
+              '',
+              `| | |`,
+              `| --- | --- |`,
+              `| URL | ${url} |`,
+              `| Smoke | ✅ ${process.env.SMOKE} |`,
+              `| PR | #${context.payload.pull_request.number} |`,
+              `| TTL | ~${ttlMin} min (budget cap: ${process.env.PREVIEW_MAX_LIFETIME_MINUTES || '40'} min job timeout) |`,
+              `| Teardown | automatic on merge/close |`,
+              '',
+              `Backend + postgres + redis via the \`preview\` compose profile. See docs/preview-environments.md.`,
+              '',
+              `_Auto-managed comment — edits are overwritten on the next deploy._`,
+            ].join('\n');
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number, per_page: 100,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number, body,
+              });
+            }
+
+      - name: Hold environment for TTL (budgeted)
+        if: steps.ceiling.outputs.skipped != 'true'
+        run: sleep "${PREVIEW_TTL_SECONDS}"
+
+      - name: Tear down preview stack
+        if: always() && steps.ceiling.outputs.skipped != 'true'
+        run: ./scripts/preview-down.sh
+
+      - name: Mark preview torn down on the PR
+        if: always() && steps.ceiling.outputs.skipped != 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- eziagric-preview-bot -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number, per_page: 100,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id,
+                body: [
+                  marker,
+                  '## 🌿 Preview environment — torn down',
+                  '',
+                  `Environment for #${context.payload.pull_request.number} has been torn down (TTL reached, job finished, or PR closed).`,
+                  'Re-add the `preview` label to spin it up again.',
+                ].join('\n'),
+              });
+            }
+
+      - name: Notify on preview failure
+        if: failure()
+        run: |
+          echo "::error title=Preview Environment Failed::Preview stack for PR #${{ github.event.pull_request.number }} failed (see logs)."
+          echo "### 🚨 Preview Environment Failure" >> $GITHUB_STEP_SUMMARY
+          echo "Stack bring-up or smoke failed for PR #${{ github.event.pull_request.number }}." >> $GITHUB_STEP_SUMMARY
+          echo "Tear-down runs regardless (always()). See docs/preview-environments.md for triage." >> $GITHUB_STEP_SUMMARY
+
+  teardown-on-close:
+    name: Teardown on Merge/Close
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PREVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Defensive teardown + orphan verification
+        run: |
+          chmod +x scripts/preview-down.sh
+          ./scripts/preview-down.sh
+
+      - name: Replace preview comment with teardown notice
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- eziagric-preview-bot -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number, per_page: 100,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            const body = [
+              marker,
+              '## 🌿 Preview environment — torn down (PR closed)',
+              '',
+              `PR #${context.payload.pull_request.number} was ${context.payload.pull_request.merged ? 'merged' : 'closed'}; the ephemeral stack was torn down and orphan verification ran.`,
+            ].join('\n');
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number, body,
+              });
+            }

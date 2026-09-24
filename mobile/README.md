@@ -100,6 +100,10 @@ Configure for your environment:
   Admin and health endpoints are never versioned.
 - `EXPO_PUBLIC_STELLAR_NETWORK` – testnet or public network
 - `EXPO_PUBLIC_PUSH_PROVIDER` – expo or firebase
+- `EXPO_PUBLIC_CRASH_INGEST_URL` – self-host crash intake (`POST /crash-reports`); see
+  [docs/crash-reporting.md](docs/crash-reporting.md)
+- `EXPO_PUBLIC_SENTRY_DSN` – optional Sentry DSN (second crash transport)
+- `EXPO_PUBLIC_CRASH_RELEASE` – release id attached to crash reports (CI sets this)
 
 ### Run in development
 
@@ -134,11 +138,21 @@ npm run lint
 ## Project structure
 
 - `src/api/` – API client and service methods, plus admin error mapping ([docs/admin-errors.md](docs/admin-errors.md))
-- `src/components/` – Shared UI components (e.g. `AdminErrorBanner`)
+- `src/components/` – Shared UI components (e.g. `AdminErrorBanner`, `CrashErrorBoundary`)
+- `src/lib/` – Crash/ANR reporting and PII scrubbing ([docs/crash-reporting.md](docs/crash-reporting.md))
 - `src/stores/` – Zustand state management
 - `src/screens/` – Screen components
 - `src/App.tsx` – Root app component
 - `app.config.ts` – Expo configuration
+
+## Crash & ANR reporting
+
+Uncaught exceptions, unhandled promise rejections, render errors caught by
+`CrashErrorBoundary`, and ANR-style main-thread stalls are scrubbed of PII
+and shipped to the self-host intake (`POST /crash-reports`) with an optional
+Sentry transport. A crash spike on a release blocks rollout promotion via
+`scripts/check-crash-gate.mjs`. Full pipeline, runbook, and config:
+[docs/crash-reporting.md](docs/crash-reporting.md).
 
 ## Admin error handling
 

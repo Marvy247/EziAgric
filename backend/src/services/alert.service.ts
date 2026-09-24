@@ -18,7 +18,10 @@ export type AlertType =
   | "outbox_critical_gaps"
   | "outbox_scan_failed"
   | "synthetic_probe_failure"
-  | "pii_log_leak_detected";
+  | "pii_log_leak_detected"
+  | "mobile_crash_spike"
+  | "deploy_rollback_triggered"
+  | "backup_stale";
 
 export interface AlertPayload {
   type: AlertType;

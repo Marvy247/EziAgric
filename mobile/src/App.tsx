@@ -15,6 +15,7 @@ import {
 import type { RootStackParamList } from './types/navigation';
 import { AppNavigator } from './navigation/AppNavigator';
 import type { NotificationData } from './services/notification.service';
+import { CrashErrorBoundary } from './components/CrashErrorBoundary';
 
 export default function App() {
   const { getToken, token } = useAuthStore();
@@ -60,11 +61,13 @@ export default function App() {
   }
 
   return (
-    <GestureHandlerRootView style={{ flex: 1 }}>
-      <SafeAreaProvider>
-        <AppNavigator isAuthenticated={!!token} />
-        <StatusBar style="dark" />
-      </SafeAreaProvider>
-    </GestureHandlerRootView>
+    <CrashErrorBoundary>
+      <GestureHandlerRootView style={{ flex: 1 }}>
+        <SafeAreaProvider>
+          <AppNavigator isAuthenticated={!!token} />
+          <StatusBar style="dark" />
+        </SafeAreaProvider>
+      </GestureHandlerRootView>
+    </CrashErrorBoundary>
   );
 }

@@ -1,0 +1,91 @@
+name: Mobile Crash Release Gate
+
+# Blocks rollout promotion when the candidate release shows a new-crash
+# spike or the crash-intake pipeline has gone silent (mobile/docs/
+# crash-reporting.md). Fails closed on missing metrics; bootstrap runs can
+# pass allow_empty=true via workflow_dispatch while the pipeline warms up.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Release id to evaluate (defaults to the tag/dispatch ref)"
+        required: false
+        default: ""
+      allow_empty:
+        description: "Bootstrap escape: pass when no crash metrics exist yet"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: crash-gate-${{ github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  crash-gate:
+    name: Crash Gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Resolve release id
+        id: release
+        run: |
+          RELEASE="${{ github.event.inputs.release || github.event.release.tag_name || github.ref_name }}"
+          echo "id=$RELEASE" >> "$GITHUB_OUTPUT"
+
+      - name: Run crash gate
+        id: gate
+        env:
+          ALLOW_EMPTY: ${{ github.event.inputs.allow_empty == 'true' && '--allow-empty' || '' }}
+        run: |
+          node scripts/check-crash-gate.mjs \
+            --release "${{ steps.release.outputs.id }}" \
+            --input mobile/crash-snapshot.jsonl \
+            $ALLOW_EMPTY
+
+      - name: Dispatch spike alert to the incident pipeline
+        if: failure() && env.ALERT_WEBHOOK_URL != ''
+        env:
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          ALERT_WEBHOOK_SECRET: ${{ secrets.ALERT_WEBHOOK_SECRET }}
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "type": "mobile_crash_spike",
+            "severity": "critical",
+            "routing": "page",
+            "runbookUrl": "https://github.com/Marvy247/EziAgric/blob/main/mobile/docs/crash-reporting.md#crash-spike-runbook",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "message": "Crash release gate failed for ${{ steps.release.outputs.id }}",
+            "details": { "release": "${{ steps.release.outputs.id }}", "source": "crash-gate.yml" }
+          }
+          EOF
+          )
+          if [ -n "${ALERT_WEBHOOK_SECRET:-}" ]; then
+            SIG=$(printf '%s' "$PAYLOAD" | openssl dgst -sha256 -hmac "$ALERT_WEBHOOK_SECRET" -hex | awk '{print $2}')
+            curl -fsS -X POST "$ALERT_WEBHOOK_URL" \
+              -H 'Content-Type: application/json' \
+              -H "X-Alert-Signature: $SIG" \
+              -d "$PAYLOAD" || true
+          else
+            curl -fsS -X POST "$ALERT_WEBHOOK_URL" \
+              -H 'Content-Type: application/json' \
+              -d "$PAYLOAD" || true
+          fi
+
+      - name: Notify on gate failure
+        if: failure()
+        run: |
+          echo "::error title=Mobile Crash Gate Failed::A new-crash spike (or missing crash metrics) blocks rollout promotion for ${{ steps.release.outputs.id }}."
+          echo "### 🚨 Mobile Crash Gate Failed" >> $GITHUB_STEP_SUMMARY
+          echo "Rollout promotion for **${{ steps.release.outputs.id }}** is blocked." >> $GITHUB_STEP_SUMMARY
+          echo "Follow mobile/docs/crash-reporting.md#crash-spike-runbook — do not promote until the gate is green." >> $GITHUB_STEP_SUMMARY

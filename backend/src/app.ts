@@ -26,6 +26,7 @@ import { csrfProtection } from "./middleware/csrf.middleware";
 import { createOutboxRoutes } from "./routes/outbox.routes";
 import { createJobHealthRoutes } from "./routes/job-health.routes";
 import { createPublicApiRouter } from "./routes/publicApi.router";
+import { createCrashRouter } from "./routes/crash.routes";
 import {
   apiVersionMiddleware,
   API_VERSION,
@@ -164,6 +165,11 @@ export function createApp(isShuttingDown?: () => boolean): express.Application {
 
   // Job heartbeat health dashboard: GET /health/jobs, GET /health/jobs/:jobType
   app.use("/health", createJobHealthRoutes());
+
+  // Mobile crash / ANR intake (issue #263). Unversioned and mounted outside
+  // the public API lanes — shipped mobile builds must not break when the
+  // consumer API version changes.
+  app.use("/crash-reports", createCrashRouter());
 
   // Admin dead-letter queue inspection/replay: GET /api/admin/dlq/:queue, POST /api/admin/dlq/:queue/:jobId/replay
   app.use(adminFeatureGate, csrfProtection, createAdminDlqRouter());

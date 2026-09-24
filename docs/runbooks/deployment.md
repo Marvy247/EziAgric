@@ -28,9 +28,20 @@ Before deploying to staging or production:
    [admin.md](../api/admin.md#feature-flags)) rather than deployed live.
 3. Confirm whether this deploy includes a Prisma migration. If so, read
    [database-migration.md](./database-migration.md) fully before continuing
-   - migrations are the highest-risk part of any deploy.
+   - migrations are the highest-risk part of any deploy. Backward-incompatible
+   migration SQL is also blocked at PR time by
+   [migration-check.yml](../migration-rollback-playbook.md#7-ci-migration-check)
+   unless the PR carries the `migration:destructive-approved` label.
 4. Take a fresh backup if deploying to production (see
-   [database-migration.md](./database-migration.md#backups)).
+   [database-migration.md](./database-migration.md#backups)), and confirm the
+   [backup freshness check](./backup-restore-drill.md) is green (a stale-backup
+   alert means RPO claims are unfounded — fix that first).
+5. The mobile **crash release gate** is green for the candidate release
+   (`.github/workflows/crash-gate.yml`, `scripts/check-crash-gate.mjs`) —
+   a new-crash spike blocks promotion exactly like a failed staging
+   validate (see [crash-reporting.md](../../mobile/docs/crash-reporting.md)).
+6. For backend changes: the [zero-downtime rolling sequence](#backend-zero-downtime-rolling-deploy)
+   below is understood and the auto-rollback trigger is armed.
 
 ## Backend deployment
 
@@ -89,6 +100,93 @@ docker compose --profile staging down -v --remove-orphans
 5. Only after the new instance passes health checks, shift traffic to it
    and stop the old instance (keep it stoppable-but-not-deleted for a
    rollback window - see [rollback.md](./rollback.md)).
+
+### Backend zero-downtime rolling deploy
+
+The strategy that makes the production sequence above drop-free (issue
+#265). Companions: [graceful-shutdown.md](../graceful-shutdown.md),
+[health-probe-semantics.md](../../backend/docs/health-probe-semantics.md),
+[migration-rollback-playbook.md](../migration-rollback-playbook.md).
+
+**1. Rolling strategy with readiness gates (already encoded in infra).**
+[`infra/k8s/backend-deployment.yaml`](../../infra/k8s/backend-deployment.yaml)
+rolls with `maxSurge: 1, maxUnavailable: 0`: the replacement pod must pass
+`startupProbe` (`/health/startup`) and `readinessProbe` (`/health/ready`)
+before it receives traffic, and the old pod is de-listed by its own
+readiness probe flipping to `503 shutdown_in_progress` (see
+`ShutdownOrchestrator`) before SIGTERM. A `preStop` sleep of 10s plus
+`terminationGracePeriodSeconds: 45` gives the load balancer time to stop
+routing to the draining pod. Reproduce the same gates in any non-k8s
+environment: never route to an instance until `GET /health/ready` and
+`GET /health/startup` are both `200`.
+
+**2. Expand → migrate → contract.**
+Schema changes ship expand-first (additive DDL + dual-write/backfill),
+contract last — full discipline in
+[migration-rollback-playbook.md §2 Expand → Migrate → Contract](../migration-rollback-playbook.md#expand--migrate--contract-discipline).
+PR-time enforcement: `migration-check.yml` fails backward-incompatible DDL
+on PRs to `main` unless `migration:destructive-approved` is set, and the PR
+template carries the migration checklist.
+
+**3. Verify connection draining under load.**
+While the rollout runs, drive read traffic through the load balancer with a
+strict zero-failure threshold:
+
+```bash
+BASE_URL=https://<staging-or-prod-host> \
+ROLLOUT_CMD="kubectl rollout restart deployment/backend" \
+./scripts/verify-rolling-deploy.sh
+```
+
+The script starts `k6/rolling-deploy.js` (`http_req_failed: rate==0`),
+triggers the rollout, waits for readiness to recover, and fails if a single
+request errored — the DoD evidence for "load test during rolling deploy
+shows zero failed requests." Unit-level drain ordering is covered by
+`backend/src/__tests__/shutdown.graceful.test.ts`.
+
+**4. Automated rollback on error-rate burn.**
+During/after a rollout, arm the burn trigger:
+
+```bash
+PROMETHEUS_URL=http://<prometheus> ALERT_WEBHOOK_URL=... \
+BASE_URL=https://<host> \
+./scripts/rollback-on-burn.sh --rollback-cmd "kubectl rollout undo deployment/backend"
+```
+
+It fires when `SLOPE_BudgetBurn_Fast_S1` is active or the live 5xx ratio
+over `--window` exceeds `--threshold` (default 5%/5m), executes the
+rollback, verifies readiness recovery, and dispatches the
+`deploy_rollback_triggered` alert (routing: page,
+[rollback.md](./rollback.md)). `--dry-run` rehearses without executing;
+`--simulate-burn` is the game-day path used to demonstrate automatic
+rollback on an injected failure (DoD), e.g.:
+
+```bash
+./scripts/rollback-on-burn.sh --simulate-burn --rollback-cmd "echo '[drill] rollback would run here'"
+```
+
+**5. Consolidated sequence (runbook form).**
+
+1. Preflight: CI green, crash gate green, fresh backup, migration gate green.
+2. Apply migrations separately via `migrate-safe.sh --env=production`
+   (expand phase only, per §2 discipline).
+3. Start `verify-rolling-deploy.sh` (or kick the rollout and then start it —
+   the script supports `MODE=manual` for rollouts you trigger yourself).
+4. Roll out the new revision (`kubectl set image ...` / `rollout restart`);
+   watch `kubectl rollout status deployment/backend`.
+5. Confirm `/health/ready` + `/health/startup` are `200` from outside the
+   cluster, then arm `rollback-on-burn.sh` for the observation window.
+6. Spot-check one read + one write endpoint
+   (§ [Post-deploy verification](#post-deploy-verification)).
+7. If burn trips: rollback runs automatically; confirm the alert page,
+   verify recovery, and open a postmortem per
+   [incident-response.md](./incident-response.md).
+8. Record the drain-verification k6 result with the release notes — it is
+   the "zero failed requests" drill evidence.
+
+Drill cadence: rehearse steps 3–5 on staging at every release train; the
+`--simulate-burn` game-day runs quarterly alongside the backup drill
+([backup-restore-drill.md](./backup-restore-drill.md)).
 
 ## Frontend deployment
 

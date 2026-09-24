@@ -9,10 +9,15 @@ Amana uses [Docker Compose profiles](https://docs.docker.com/compose/profiles/) 
 | `dev`     | postgres, redis                 | 5432      | 6379         | persistent    |
 | `staging` | postgres-staging, redis-staging | 5434      | 6380         | persistent    |
 | `test`    | postgres-test, redis-test       | 5433      | 6381         | tmpfs (ephemeral) |
+| `preview` | backend-preview, postgres-preview, redis-preview | 5435 | 6382 | tmpfs (ephemeral, per-PR) |
+
+The `preview` profile is the per-PR ephemeral stack (backend + DB + redis)
+driven by the `preview` label — see [preview-environments.md](./preview-environments.md)
+for lifecycle, budget caps, and the concurrency ceiling.
 
 ## Quick Start
 
-Helper scripts handle startup, migration, and (for staging) seed:
+Helper scripts handle startup, migration, and (for staging/preview) seed:
 
 ```bash
 # Local development
@@ -24,6 +29,9 @@ cp .env.staging.example .env.staging   # fill in values first
 
 # Test / CI (ephemeral, no persistent state)
 ./scripts/test-up.sh
+
+# Per-PR preview (requires PREVIEW_PR_NUMBER)
+PREVIEW_PR_NUMBER=123 ./scripts/preview-up.sh
 ```
 
 ## Manual Usage
@@ -33,6 +41,7 @@ cp .env.staging.example .env.staging   # fill in values first
 docker compose --profile dev     up -d
 docker compose --profile staging up -d
 docker compose --profile test    up -d
+docker compose --profile preview up -d
 
 # Tear down (keep volumes)
 docker compose --profile dev down
@@ -60,6 +69,11 @@ Each profile honours environment variables with profile-specific prefixes:
 | `STAGING_REDIS_PORT`      | `6380`                     | staging  |
 | `TEST_POSTGRES_PORT`      | `5433`                     | test     |
 | `TEST_REDIS_PORT`         | `6381`                     | test     |
+| `PREVIEW_PORT`            | `4001`                     | preview  |
+| `PREVIEW_POSTGRES_PORT`   | `5435`                     | preview  |
+| `PREVIEW_REDIS_PORT`      | `6382`                     | preview  |
+| `PREVIEW_JWT_SECRET`      | dev-only placeholder       | preview  |
+| `PREVIEW_CONTRACT_ID`     | testnet placeholder        | preview  |
 
 Copy `.env.staging.example` to `.env.staging` to override staging defaults. Never commit `.env.staging`.
 
