@@ -63,7 +63,7 @@ jobs:
             "type": "mobile_crash_spike",
             "severity": "critical",
             "routing": "page",
-            "runbookUrl": "https://github.com/Marvy247/EziAgric/blob/main/mobile/docs/crash-reporting.md#crash-spike-runbook",
+            "runbookUrl": "https://github.com/EziAgric/EziAgric/blob/main/mobile/docs/crash-reporting.md#crash-spike-runbook",
             "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "message": "Crash release gate failed for ${{ steps.release.outputs.id }}",
             "details": { "release": "${{ steps.release.outputs.id }}", "source": "crash-gate.yml" }

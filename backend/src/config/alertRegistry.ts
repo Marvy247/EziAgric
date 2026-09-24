@@ -117,7 +117,7 @@ export const ALERT_REGISTRY: Record<AlertType, AlertRegistryEntry> = {
   mobile_crash_spike: {
     routing: "page",
     runbookUrl:
-      "https://github.com/Marvy247/EziAgric/blob/main/mobile/docs/crash-reporting.md#crash-spike-runbook",
+      "https://github.com/EziAgric/EziAgric/blob/main/mobile/docs/crash-reporting.md#crash-spike-runbook",
     description:
       "A release crossed the crash/ANR spike threshold — blocks rollout promotion until triaged.",
     // Spikes persist while the offending build is out; 15 minutes matches
